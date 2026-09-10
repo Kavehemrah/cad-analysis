@@ -1,4 +1,5 @@
 import math
+import time
 
 import pythoncom
 import win32com.client
@@ -25,6 +26,8 @@ OFFSET_M = OFFSET_MM / 1000.0
 SLEEPER_LAYER = "AG_Print"
 SLEEPER_BLOCKS = {"AG_t", "AG_tttt"}
 SEARCH_RADIUS_M = 5.0
+COM_RETRIES = 10
+COM_RETRY_DELAY = 0.20
 
 
 def point_variant(x: float, y: float, z: float = 0.0):
@@ -75,6 +78,101 @@ def polygon_centroid(points):
     return cx / (3.0 * area2), cy / (3.0 * area2)
 
 
+def wait_for_autocad_quiet(acad, retries=COM_RETRIES):
+    """Wait until AutoCAD reports a quiescent state."""
+    state = None
+    try:
+        state = acad.GetAcadState()
+    except Exception:
+        return
+
+    for _ in range(retries):
+        try:
+            if state.IsQuiescent:
+                return
+        except Exception:
+            return
+        pythoncom.PumpWaitingMessages()
+        time.sleep(COM_RETRY_DELAY)
+
+
+def is_com_busy_error(exc):
+    text = str(exc)
+    return (
+        "Call was rejected by callee" in text
+        or "-2147418111" in text
+        or "RPC_E_CALL_REJECTED" in text
+    )
+
+
+def find_nearest_sleeper(doc):
+    """Find nearest sleeper using insertion points only.
+
+    The complete ModelSpace enumeration is retried when AutoCAD is
+    temporarily busy. This prevents a transient COM rejection from
+    aborting the test.
+    """
+    limit2 = SEARCH_RADIUS_M * SEARCH_RADIUS_M
+
+    for attempt in range(1, COM_RETRIES + 1):
+        best = None
+
+        try:
+            # One enumeration only per attempt; geometry is NOT read here.
+            for obj in doc.ModelSpace:
+                try:
+                    if obj.ObjectName != "AcDbBlockReference":
+                        continue
+                    if str(obj.Layer) != SLEEPER_LAYER:
+                        continue
+
+                    try:
+                        block_name = str(obj.EffectiveName)
+                    except Exception:
+                        block_name = str(obj.Name)
+
+                    if block_name not in SLEEPER_BLOCKS:
+                        continue
+
+                    ins = tuple(obj.InsertionPoint)
+                    ix = float(ins[0])
+                    iy = float(ins[1])
+                    d2 = distance2(PIPE_X, PIPE_Y, ix, iy)
+
+                    if d2 > limit2:
+                        continue
+
+                    if best is None or d2 < best["d2"]:
+                        best = {
+                            "obj": obj,
+                            "block": block_name,
+                            "insertion": (ix, iy),
+                            "rotation": float(obj.Rotation),
+                            "sx": float(obj.XScaleFactor),
+                            "sy": float(obj.YScaleFactor),
+                            "d2": d2,
+                        }
+                except Exception as exc:
+                    if is_com_busy_error(exc):
+                        raise
+                    continue
+
+            return best
+
+        except Exception as exc:
+            if not is_com_busy_error(exc) or attempt == COM_RETRIES:
+                raise
+
+            print(
+                f"AutoCAD busy; retrying ModelSpace scan "
+                f"({attempt}/{COM_RETRIES})..."
+            )
+            pythoncom.PumpWaitingMessages()
+            time.sleep(COM_RETRY_DELAY)
+
+    return None
+
+
 def get_sleeper_geometry(doc, block_name):
     block_def = doc.Blocks.Item(block_name)
 
@@ -91,54 +189,12 @@ def get_sleeper_geometry(doc, block_name):
 
             if len(vertices) >= 3:
                 return vertices
-        except Exception:
+        except Exception as exc:
+            if is_com_busy_error(exc):
+                raise
             continue
 
     raise RuntimeError(f"No usable polyline found in sleeper block: {block_name}")
-
-
-def find_nearest_sleeper(doc):
-    """Find nearest sleeper using insertion points only."""
-    best = None
-    limit2 = SEARCH_RADIUS_M * SEARCH_RADIUS_M
-
-    for obj in doc.ModelSpace:
-        try:
-            if obj.ObjectName != "AcDbBlockReference":
-                continue
-            if str(obj.Layer) != SLEEPER_LAYER:
-                continue
-
-            try:
-                block_name = str(obj.EffectiveName)
-            except Exception:
-                block_name = str(obj.Name)
-
-            if block_name not in SLEEPER_BLOCKS:
-                continue
-
-            ins = tuple(obj.InsertionPoint)
-            ix = float(ins[0])
-            iy = float(ins[1])
-            d2 = distance2(PIPE_X, PIPE_Y, ix, iy)
-
-            if d2 > limit2:
-                continue
-
-            if best is None or d2 < best["d2"]:
-                best = {
-                    "obj": obj,
-                    "block": block_name,
-                    "insertion": (ix, iy),
-                    "rotation": float(obj.Rotation),
-                    "sx": float(obj.XScaleFactor),
-                    "sy": float(obj.YScaleFactor),
-                    "d2": d2,
-                }
-        except Exception:
-            continue
-
-    return best
 
 
 # ============================================================
@@ -147,6 +203,8 @@ def find_nearest_sleeper(doc):
 acad = win32com.client.GetActiveObject("AutoCAD.Application")
 doc = acad.ActiveDocument
 ms = doc.ModelSpace
+
+wait_for_autocad_quiet(acad)
 
 # Pipe axis.
 dx = P2_X - P1_X
@@ -162,14 +220,15 @@ uy = dy / pipe_length
 n1 = (-uy, ux)
 n2 = (uy, -ux)
 
-# Fast search: find the nearest sleeper from insertion points.
+# Fast search: insertion points only.
+print("Searching nearest sleeper...")
 sleeper = find_nearest_sleeper(doc)
 if sleeper is None:
     raise RuntimeError(
         f"No {SLEEPER_LAYER} sleeper block found within {SEARCH_RADIUS_M:.1f} m."
     )
 
-# Geometry is transformed only for that one sleeper.
+# Read geometry only for that one sleeper.
 local_vertices = get_sleeper_geometry(doc, sleeper["block"])
 world_vertices = [
     local_to_world(
@@ -186,19 +245,17 @@ world_vertices = [
 sleeper_cx, sleeper_cy = polygon_centroid(world_vertices)
 
 # Pick the normal that points away from the sleeper center.
-# This avoids the previous bad assumption that Y- is always "down".
 side_x = PIPE_X - sleeper_cx
 side_y = PIPE_Y - sleeper_cy
-
 score1 = side_x * n1[0] + side_y * n1[1]
 score2 = side_x * n2[0] + side_y * n2[1]
-
 away_x, away_y = n1 if score1 >= score2 else n2
 
 new_x = PIPE_X + away_x * OFFSET_M
 new_y = PIPE_Y + away_y * OFFSET_M
 
 # Draw minimal debug geometry.
+wait_for_autocad_quiet(acad)
 ms.AddPoint(point_variant(PIPE_X, PIPE_Y, PIPE_Z))
 ms.AddPoint(point_variant(sleeper_cx, sleeper_cy, PIPE_Z))
 ms.AddPoint(point_variant(new_x, new_y, PIPE_Z))
@@ -215,7 +272,7 @@ ms.AddText("OFFSET 150mm AWAY", point_variant(new_x, new_y, PIPE_Z), text_height
 doc.Regen(1)
 
 print("=" * 72)
-print("PIPE OFFSET DIRECTION TEST - FAST")
+print("PIPE OFFSET DIRECTION TEST - FAST / COM SAFE")
 print("=" * 72)
 print(f"Original        X={PIPE_X:.6f}, Y={PIPE_Y:.6f}")
 print(f"Pipe axis       ({ux:.9f}, {uy:.9f})")
