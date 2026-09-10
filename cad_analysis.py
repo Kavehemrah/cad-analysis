@@ -3,7 +3,6 @@ import time
 from dataclasses import dataclass
 
 import pythoncom
-import win32com.client
 from win32com.client import VARIANT
 
 
@@ -48,8 +47,10 @@ def local_to_world(x, y, insertion, rotation, sx=1.0, sy=1.0):
     y *= sy
     c = math.cos(rotation)
     s = math.sin(rotation)
-    return (insertion[0] + x * c - y * s,
-            insertion[1] + x * s + y * c)
+    return (
+        insertion[0] + x * c - y * s,
+        insertion[1] + x * s + y * c,
+    )
 
 
 def world_to_local(x, y, insertion, rotation):
@@ -62,9 +63,11 @@ def world_to_local(x, y, insertion, rotation):
 
 def is_busy(exc):
     text = str(exc)
-    return ("Call was rejected by callee" in text or
-            "RPC_E_CALL_REJECTED" in text or
-            "-2147418111" in text)
+    return (
+        "Call was rejected by callee" in text
+        or "RPC_E_CALL_REJECTED" in text
+        or "-2147418111" in text
+    )
 
 
 def retry(call):
@@ -166,6 +169,7 @@ class Detector:
                 continue
         if len(lines) < 2:
             raise RuntimeError("Could not find two E Pipe side lines")
+
         best = None
         for i in range(len(lines)):
             for j in range(i + 1, len(lines)):
@@ -187,16 +191,26 @@ class Detector:
                 sep = abs(dx * sy - dy * sx) / denom
                 if not (0.005 <= sep <= 0.20):
                     continue
-                score = min_len + 2.0 * ratio - 20.0 * abs(sep - EXPECTED_PIPE_DIAMETER_M)
+                score = (
+                    min_len
+                    + 2.0 * ratio
+                    - 20.0 * abs(sep - EXPECTED_PIPE_DIAMETER_M)
+                )
                 if best is None or score > best[0]:
                     best = (score, (a1, a2), (b1, b2), sep)
+
         if best is None:
             raise RuntimeError("Could not identify pipe side pair")
+
         _, line1, line2, sep = best
-        p1 = ((line1[0][0] + line2[0][0]) / 2.0,
-              (line1[0][1] + line2[0][1]) / 2.0)
-        p2 = ((line1[1][0] + line2[1][0]) / 2.0,
-              (line1[1][1] + line2[1][1]) / 2.0)
+        p1 = (
+            (line1[0][0] + line2[0][0]) / 2.0,
+            (line1[0][1] + line2[0][1]) / 2.0,
+        )
+        p2 = (
+            (line1[1][0] + line2[1][0]) / 2.0,
+            (line1[1][1] + line2[1][1]) / 2.0,
+        )
         return (p1, p2), sep
 
     @staticmethod
@@ -207,12 +221,12 @@ class Detector:
         if name == "AcDbLine":
             a = tuple(ent.StartPoint)
             b = tuple(ent.EndPoint)
-            return [(float(a[0]), float(a[1])),
-                    (float(b[0]), float(b[1]))]
+            return [
+                (float(a[0]), float(a[1])),
+                (float(b[0]), float(b[1])),
+            ]
 
         if name in {"AcDbPolyline", "AcDb2dPolyline", "AcDb3dPolyline"}:
-            # For lightweight/2D polylines Coordinates is the most reliable
-            # representation available from a block definition.
             try:
                 coords = tuple(ent.Coordinates)
                 if name == "AcDb3dPolyline":
@@ -220,12 +234,13 @@ class Detector:
                     for i in range(0, len(coords), 3):
                         pts.append((float(coords[i]), float(coords[i + 1])))
                     return pts
-                return [(float(coords[i]), float(coords[i + 1]))
-                        for i in range(0, len(coords), 2)]
+                return [
+                    (float(coords[i]), float(coords[i + 1]))
+                    for i in range(0, len(coords), 2)
+                ]
             except Exception:
                 pass
 
-            # Fallback for old-style 2D polyline entities.
             pts = []
             try:
                 for v in ent:
@@ -242,6 +257,7 @@ class Detector:
         block = self.doc.Blocks.Item(block_name)
         points = []
         entity_count = 0
+
         for ent in block:
             try:
                 pts = self._entity_points(ent)
@@ -276,18 +292,27 @@ class Detector:
             "max_y": max_y,
             "width_m": min(span_x, span_y),
             "length_m": max(span_x, span_y),
-            "center_local": ((min_x + max_x) / 2.0,
-                             (min_y + max_y) / 2.0),
+            "center_local": (
+                (min_x + max_x) / 2.0,
+                (min_y + max_y) / 2.0,
+            ),
             "entity_count": entity_count,
         }
 
     def collect_instances(self):
         drainages = []
         sleepers = []
-        for obj in retry(lambda: self.doc.ModelSpace):
+
+        model_space = retry(lambda: self.doc.ModelSpace)
+        count = int(retry(lambda: model_space.Count))
+
+        for index in range(count):
             try:
-                if obj.ObjectName != "AcDbBlockReference":
+                obj = retry(lambda index=index: model_space.Item(index))
+
+                if str(obj.ObjectName) != "AcDbBlockReference":
                     continue
+
                 name = str(obj.EffectiveName)
                 ins = tuple(obj.InsertionPoint)
                 insertion = (float(ins[0]), float(ins[1]))
@@ -295,6 +320,7 @@ class Detector:
                 sx = float(obj.XScaleFactor)
                 sy = float(obj.YScaleFactor)
                 handle = str(obj.Handle)
+
                 if name == DRAINAGE_BLOCK:
                     drainages.append({
                         "handle": handle,
@@ -308,7 +334,12 @@ class Detector:
                     profile = self.sleeper_profiles[name]
                     center_local = profile["center_local"]
                     center_world = local_to_world(
-                        center_local[0], center_local[1], insertion, rot, sx, sy
+                        center_local[0],
+                        center_local[1],
+                        insertion,
+                        rot,
+                        sx,
+                        sy,
                     )
                     scale = max(abs(sx), abs(sy))
                     sleepers.append(Sleeper(
@@ -322,8 +353,12 @@ class Detector:
                         center_local,
                         center_world,
                     ))
-            except Exception:
+            except Exception as exc:
+                if is_busy(exc):
+                    pythoncom.PumpWaitingMessages()
+                    time.sleep(COM_DELAY)
                 continue
+
         return drainages, sleepers
 
     @staticmethod
@@ -369,7 +404,7 @@ class Detector:
                 for s in grid.get((ix, iy), []):
                     lx, ly = world_to_local(
                         pipe.center[0], pipe.center[1],
-                        s.center_world, s.rotation
+                        s.center_world, s.rotation,
                     )
                     ad = angle_diff(pipe.axis_deg, math.degrees(s.rotation))
                     half_w = s.width_m / 2.0
@@ -501,9 +536,11 @@ class Detector:
 
         moved = 0
         for r in results:
-            if (r.status != "BLOCKED"
-                    or r.required_move_mm <= 0
-                    or r.confidence not in {"HIGH", "MEDIUM"}):
+            if (
+                r.status != "BLOCKED"
+                or r.required_move_mm <= 0
+                or r.confidence not in {"HIGH", "MEDIUM"}
+            ):
                 continue
             try:
                 obj = retry(lambda h=r.drainage: self.doc.HandleToObject(h))
