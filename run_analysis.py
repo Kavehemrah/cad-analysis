@@ -16,7 +16,7 @@ def parse_args():
     parser.add_argument(
         "--apply",
         action="store_true",
-        help="Create colored moved copies in AutoCAD; originals are preserved",
+        help="Move the original drainage objects in AutoCAD",
     )
     parser.add_argument(
         "--save",
@@ -50,7 +50,7 @@ def main():
         print("CAD DRAINAGE ANALYSIS")
         print("=" * 100)
         print(f"Drawing : {doc.Name}")
-        print(f"Mode    : {'APPLY' if args.apply else 'ANALYZE ONLY'}")
+        print(f"Mode    : {'APPLY - MOVE ORIGINAL' if args.apply else 'ANALYZE ONLY'}")
         print(f"Clearance: {args.clearance_mm:.1f} mm")
         print("Scope   : FULL DRAWING")
         print()
@@ -71,9 +71,9 @@ def main():
         moved = 0
         if args.apply:
             print()
-            print("Creating moved copies; original drainage objects will be preserved...")
+            print("Moving original drainage objects...")
             moved = detector.apply_moves(results, save=args.save)
-            print(f"Moved copies created: {moved}")
+            print(f"Moved: {moved}")
 
         report_path = args.report
         if not report_path:
