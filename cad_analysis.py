@@ -19,7 +19,8 @@ MATCH_MARGIN_M = 0.080
 GRID_SIZE_M = 5.0
 COM_RETRIES = 12
 COM_DELAY = 0.20
-MARKER_LAYER = "CAD_ANALYSIS_MOVE"
+MOVED_LAYER = "CAD_ANALYSIS_MOVED"
+MOVED_COLOR_INDEX = 1
 
 
 def distance(a, b):
@@ -156,7 +157,7 @@ class Detector:
         lines = []
         for ent in block:
             try:
-                if ent.ObjectName != "AcDbLine" or str(ent.Layer) != "E Pipe":
+                if str(ent.ObjectName) != "AcDbLine" or str(ent.Layer) != "E Pipe":
                     continue
                 a = tuple(ent.StartPoint)
                 b = tuple(ent.EndPoint)
@@ -167,6 +168,7 @@ class Detector:
                     lines.append((p1, p2, length, orientation(p1, p2)))
             except Exception:
                 continue
+
         if len(lines) < 2:
             raise RuntimeError("Could not find two E Pipe side lines")
 
@@ -177,20 +179,24 @@ class Detector:
                 b1, b2, lb, ab = lines[j]
                 if angle_diff(aa, ab) > PAIR_ANGLE_TOLERANCE_DEG:
                     continue
+
                 min_len = min(la, lb)
                 ratio = min_len / max(la, lb)
                 if ratio < 0.90:
                     continue
+
                 sx = a2[0] - a1[0]
                 sy = a2[1] - a1[1]
                 denom = math.hypot(sx, sy)
                 if denom < 1e-12:
                     continue
+
                 dx = b1[0] - a1[0]
                 dy = b1[1] - a1[1]
                 sep = abs(dx * sy - dy * sx) / denom
                 if not (0.005 <= sep <= 0.20):
                     continue
+
                 score = (
                     min_len
                     + 2.0 * ratio
@@ -215,7 +221,6 @@ class Detector:
 
     @staticmethod
     def _entity_points(ent):
-        """Read local XY points without relying on GeometricExtents."""
         name = str(ent.ObjectName)
 
         if name == "AcDbLine":
@@ -230,10 +235,10 @@ class Detector:
             try:
                 coords = tuple(ent.Coordinates)
                 if name == "AcDb3dPolyline":
-                    pts = []
-                    for i in range(0, len(coords), 3):
-                        pts.append((float(coords[i]), float(coords[i + 1])))
-                    return pts
+                    return [
+                        (float(coords[i]), float(coords[i + 1]))
+                        for i in range(0, len(coords), 3)
+                    ]
                 return [
                     (float(coords[i]), float(coords[i + 1]))
                     for i in range(0, len(coords), 2)
@@ -241,15 +246,15 @@ class Detector:
             except Exception:
                 pass
 
-            pts = []
+            points = []
             try:
-                for v in ent:
-                    p = tuple(v.Coordinates)
-                    if len(p) >= 2:
-                        pts.append((float(p[0]), float(p[1])))
+                for vertex in ent:
+                    coords = tuple(vertex.Coordinates)
+                    if len(coords) >= 2:
+                        points.append((float(coords[0]), float(coords[1])))
             except Exception:
                 pass
-            return pts
+            return points
 
         return []
 
@@ -309,11 +314,11 @@ class Detector:
         for index in range(count):
             try:
                 obj = retry(lambda index=index: model_space.Item(index))
-
                 if str(obj.ObjectName) != "AcDbBlockReference":
                     continue
 
                 name = str(obj.EffectiveName)
+                layer = str(obj.Layer)
                 ins = tuple(obj.InsertionPoint)
                 insertion = (float(ins[0]), float(ins[1]))
                 rot = float(obj.Rotation)
@@ -322,6 +327,9 @@ class Detector:
                 handle = str(obj.Handle)
 
                 if name == DRAINAGE_BLOCK:
+                    # Never re-analyze copies produced by this tool.
+                    if layer == MOVED_LAYER:
+                        continue
                     drainages.append({
                         "handle": handle,
                         "obj": obj,
@@ -330,7 +338,8 @@ class Detector:
                         "sx": sx,
                         "sy": sy,
                     })
-                elif str(obj.Layer) == SLEEPER_LAYER and name in SLEEPER_BLOCKS:
+
+                elif layer == SLEEPER_LAYER and name in SLEEPER_BLOCKS:
                     profile = self.sleeper_profiles[name]
                     center_local = profile["center_local"]
                     center_world = local_to_world(
@@ -342,17 +351,20 @@ class Detector:
                         sy,
                     )
                     scale = max(abs(sx), abs(sy))
-                    sleepers.append(Sleeper(
-                        handle,
-                        obj,
-                        name,
-                        insertion,
-                        rot,
-                        profile["width_m"] * scale,
-                        profile["length_m"] * scale,
-                        center_local,
-                        center_world,
-                    ))
+                    sleepers.append(
+                        Sleeper(
+                            handle,
+                            obj,
+                            name,
+                            insertion,
+                            rot,
+                            profile["width_m"] * scale,
+                            profile["length_m"] * scale,
+                            center_local,
+                            center_world,
+                        )
+                    )
+
             except Exception as exc:
                 if is_busy(exc):
                     pythoncom.PumpWaitingMessages()
@@ -367,9 +379,9 @@ class Detector:
 
     def _build_grid(self, sleepers):
         grid = {}
-        for s in sleepers:
-            key = self._grid_key(s.center_world, GRID_SIZE_M)
-            grid.setdefault(key, []).append(s)
+        for sleeper in sleepers:
+            key = self._grid_key(sleeper.center_world, GRID_SIZE_M)
+            grid.setdefault(key, []).append(sleeper)
         return grid
 
     def extract_pipe(self, raw, scale_radius=True):
@@ -378,11 +390,16 @@ class Detector:
         sx = float(raw["sx"])
         sy = float(raw["sy"])
         lp1, lp2 = self.centerline_local
+
         p1 = local_to_world(lp1[0], lp1[1], ins, rot, sx, sy)
         p2 = local_to_world(lp2[0], lp2[1], ins, rot, sx, sy)
-        center = ((p1[0] + p2[0]) / 2.0, (p1[1] + p2[1]) / 2.0)
+        center = (
+            (p1[0] + p2[0]) / 2.0,
+            (p1[1] + p2[1]) / 2.0,
+        )
         ux, uy = normalize(p2[0] - p1[0], p2[1] - p1[1])
         scale = (abs(sx) + abs(sy)) / 2.0 if scale_radius else 1.0
+
         return Pipe(
             raw["handle"],
             raw["obj"],
@@ -399,24 +416,32 @@ class Detector:
     def match_sleeper(self, pipe, grid, sleepers):
         key = self._grid_key(pipe.center, GRID_SIZE_M)
         candidates = []
+
         for ix in range(key[0] - 1, key[0] + 2):
             for iy in range(key[1] - 1, key[1] + 2):
-                for s in grid.get((ix, iy), []):
+                for sleeper in grid.get((ix, iy), []):
                     lx, ly = world_to_local(
-                        pipe.center[0], pipe.center[1],
-                        s.center_world, s.rotation,
+                        pipe.center[0],
+                        pipe.center[1],
+                        sleeper.center_world,
+                        sleeper.rotation,
                     )
-                    ad = angle_diff(pipe.axis_deg, math.degrees(s.rotation))
-                    half_w = s.width_m / 2.0
-                    half_l = s.length_m / 2.0
+                    ad = angle_diff(
+                        pipe.axis_deg,
+                        math.degrees(sleeper.rotation),
+                    )
+                    half_w = sleeper.width_m / 2.0
+                    half_l = sleeper.length_m / 2.0
+
                     if ad > SLEEPER_ANGLE_TOLERANCE_DEG:
                         continue
                     if abs(lx) > half_l + MATCH_MARGIN_M:
                         continue
                     if abs(ly) > half_w + pipe.radius_m + MATCH_MARGIN_M:
                         continue
+
                     score = abs(ly) + 0.25 * abs(lx) + 0.02 * ad
-                    candidates.append((score, s, lx, ly, ad))
+                    candidates.append((score, sleeper, lx, ly, ad))
 
         candidates.sort(key=lambda x: x[0])
         if not candidates:
@@ -438,9 +463,12 @@ class Detector:
             try:
                 pipe = self.extract_pipe(raw)
                 match, confidence, alternatives = self.match_sleeper(
-                    pipe, grid, sleepers
+                    pipe,
+                    grid,
+                    sleepers,
                 )
-                r = Result(
+
+                result = Result(
                     drainage=pipe.handle,
                     pipe_axis_deg=pipe.axis_deg,
                     pipe_x=pipe.center[0],
@@ -449,30 +477,32 @@ class Detector:
                 )
 
                 if match is None:
-                    r.status = "UNMATCHED" if confidence == "" else "AMBIGUOUS"
-                    r.confidence = confidence
-                    r.note = "No unique blocking sleeper detected"
+                    result.status = (
+                        "UNMATCHED" if confidence == "" else "AMBIGUOUS"
+                    )
+                    result.confidence = confidence
+                    result.note = "No unique blocking sleeper detected"
                     if alternatives:
-                        r.note += "; alternatives=" + ",".join(
-                            x[1].handle for x in alternatives
+                        result.note += "; alternatives=" + ",".join(
+                            item[1].handle for item in alternatives
                         )
-                    results.append(r)
+                    results.append(result)
                     continue
 
                 _, sleeper, lx, ly, ad = match
-                r.sleeper = sleeper.handle
-                r.status = (
+                result.sleeper = sleeper.handle
+                result.status = (
                     "BLOCKED"
                     if abs(ly) <= sleeper.width_m / 2.0 + pipe.radius_m
                     else "CLEAR"
                 )
-                r.confidence = confidence
-                r.sleeper_axis_deg = math.degrees(sleeper.rotation)
-                r.angle_diff_deg = ad
-                r.sleeper_x, r.sleeper_y = sleeper.center_world
-                r.local_x, r.local_y = lx, ly
-                r.sleeper_width_mm = sleeper.width_m * 1000.0
-                r.current_clearance_mm = (
+                result.confidence = confidence
+                result.sleeper_axis_deg = math.degrees(sleeper.rotation)
+                result.angle_diff_deg = ad
+                result.sleeper_x, result.sleeper_y = sleeper.center_world
+                result.local_x, result.local_y = lx, ly
+                result.sleeper_width_mm = sleeper.width_m * 1000.0
+                result.current_clearance_mm = (
                     abs(ly) - sleeper.width_m / 2.0 - pipe.radius_m
                 ) * 1000.0
 
@@ -482,9 +512,12 @@ class Detector:
                     + self.clearance_m
                 )
                 move = max(0.0, target - abs(ly))
-                r.required_move_mm = move * 1000.0
-                r.final_clearance_mm = (
-                    max(r.current_clearance_mm, self.clearance_m * 1000.0)
+                result.required_move_mm = move * 1000.0
+                result.final_clearance_mm = (
+                    max(
+                        result.current_clearance_mm,
+                        self.clearance_m * 1000.0,
+                    )
                     if move == 0
                     else self.clearance_m * 1000.0
                 )
@@ -497,89 +530,117 @@ class Detector:
                 na, nb = pipe.normal_a, pipe.normal_b
                 da = na[0] * sleeper_y_world[0] + na[1] * sleeper_y_world[1]
                 db = nb[0] * sleeper_y_world[0] + nb[1] * sleeper_y_world[1]
-                toward_side = na if da >= db else nb
+                move_dir = na if da >= db else nb
                 if sign < 0:
-                    toward_side = na if da <= db else nb
+                    move_dir = na if da <= db else nb
 
-                r.move_dir_x, r.move_dir_y = toward_side
-                r.old_x, r.old_y = pipe.center
-                r.new_x = pipe.center[0] + toward_side[0] * move
-                r.new_y = pipe.center[1] + toward_side[1] * move
+                result.move_dir_x, result.move_dir_y = move_dir
+                result.old_x, result.old_y = pipe.center
+                result.new_x = pipe.center[0] + move_dir[0] * move
+                result.new_y = pipe.center[1] + move_dir[1] * move
 
-                if r.status == "BLOCKED" and move > 0:
-                    r.note = "Move required"
+                if result.status == "BLOCKED" and move > 0:
+                    result.note = "Move required; original will be preserved"
                 else:
-                    r.note = "No movement required"
-                results.append(r)
+                    result.note = "No movement required"
+
+                results.append(result)
 
             except Exception as exc:
-                results.append(Result(
-                    drainage=raw["handle"],
-                    status="ERROR",
-                    note=f"{type(exc).__name__}: {exc}",
-                ))
+                results.append(
+                    Result(
+                        drainage=raw["handle"],
+                        status="ERROR",
+                        note=f"{type(exc).__name__}: {exc}",
+                    )
+                )
 
         return results
 
-    def _ensure_marker_layer(self):
+    def _ensure_moved_layer(self):
         try:
-            return self.doc.Layers.Item(MARKER_LAYER)
+            layer = retry(lambda: self.doc.Layers.Item(MOVED_LAYER))
         except Exception:
-            return self.doc.Layers.Add(MARKER_LAYER)
+            layer = retry(lambda: self.doc.Layers.Add(MOVED_LAYER))
+
+        try:
+            layer.Color = MOVED_COLOR_INDEX
+        except Exception:
+            pass
+        return layer
 
     def apply_moves(self, results, save=False):
-        marker_layer = self._ensure_marker_layer()
+        moved = 0
+        moved_layer = self._ensure_moved_layer()
+
         try:
             self.doc.StartUndoMark()
         except Exception:
             pass
 
-        moved = 0
-        for r in results:
+        for result in results:
             if (
-                r.status != "BLOCKED"
-                or r.required_move_mm <= 0
-                or r.confidence not in {"HIGH", "MEDIUM"}
+                result.status != "BLOCKED"
+                or result.required_move_mm <= 0
+                or result.confidence not in {"HIGH", "MEDIUM"}
             ):
                 continue
+
             try:
-                obj = retry(lambda h=r.drainage: self.doc.HandleToObject(h))
-                dx = r.new_x - r.old_x
-                dy = r.new_y - r.old_y
-                retry(lambda obj=obj, dx=dx, dy=dy: obj.Move(
-                    VARIANT(
-                        pythoncom.VT_ARRAY | pythoncom.VT_R8,
-                        (0.0, 0.0, 0.0),
-                    ),
-                    VARIANT(
-                        pythoncom.VT_ARRAY | pythoncom.VT_R8,
-                        (dx, dy, 0.0),
-                    ),
-                ))
-                line = retry(lambda r=r: self.doc.ModelSpace.AddLine(
-                    VARIANT(
-                        pythoncom.VT_ARRAY | pythoncom.VT_R8,
-                        (r.old_x, r.old_y, 0.0),
-                    ),
-                    VARIANT(
-                        pythoncom.VT_ARRAY | pythoncom.VT_R8,
-                        (r.new_x, r.new_y, 0.0),
-                    ),
-                ))
-                line.Layer = MARKER_LAYER
+                original = retry(
+                    lambda handle=result.drainage: self.doc.HandleToObject(handle)
+                )
+                dx = result.new_x - result.old_x
+                dy = result.new_y - result.old_y
+
+                # Preserve the original object. Move only its copied reference.
+                copied = retry(lambda original=original: original.Copy())
+                retry(
+                    lambda copied=copied, dx=dx, dy=dy: copied.Move(
+                        VARIANT(
+                            pythoncom.VT_ARRAY | pythoncom.VT_R8,
+                            (0.0, 0.0, 0.0),
+                        ),
+                        VARIANT(
+                            pythoncom.VT_ARRAY | pythoncom.VT_R8,
+                            (dx, dy, 0.0),
+                        ),
+                    )
+                )
+
+                try:
+                    copied.Layer = MOVED_LAYER
+                except Exception:
+                    pass
+                try:
+                    copied.Color = MOVED_COLOR_INDEX
+                except Exception:
+                    pass
+
+                result.note = (
+                    f"Moved copy created; original preserved; "
+                    f"move={result.required_move_mm:.1f} mm; "
+                    f"direction=({result.move_dir_x:.4f}, {result.move_dir_y:.4f})"
+                )
                 moved += 1
+
             except Exception as exc:
-                r.status = "ERROR"
-                r.note = f"Move failed: {type(exc).__name__}: {exc}"
+                result.status = "ERROR"
+                result.note = (
+                    f"Move copy failed: {type(exc).__name__}: {exc}"
+                )
 
         try:
             self.doc.Regen(1)
         except Exception:
             pass
+
         try:
             self.doc.EndUndoMark()
         except Exception:
             pass
+
         if save:
             retry(lambda: self.doc.Save())
+
         return moved
