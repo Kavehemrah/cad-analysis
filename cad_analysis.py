@@ -11,7 +11,7 @@ SLEEPER_LAYER = "AG_Print"
 SLEEPER_BLOCKS = {"AG_t", "AG_tttt"}
 
 EXPECTED_PIPE_DIAMETER_M = 0.063
-DEFAULT_CLEARANCE_M = 0.100
+DEFAULT_CLEARANCE_M = 0.050
 MIN_PIPE_LINE_LENGTH_M = 1.0
 PAIR_ANGLE_TOLERANCE_DEG = 2.0
 SLEEPER_ANGLE_TOLERANCE_DEG = 8.0
@@ -19,8 +19,7 @@ MATCH_MARGIN_M = 0.080
 GRID_SIZE_M = 5.0
 COM_RETRIES = 12
 COM_DELAY = 0.20
-MOVED_LAYER = "CAD_ANALYSIS_MOVED"
-MOVED_COLOR_INDEX = 1
+MARKER_LAYER = "CAD_ANALYSIS_MOVE"
 
 
 def distance(a, b):
@@ -59,7 +58,7 @@ def world_to_local(x, y, insertion, rotation):
     dy = y - insertion[1]
     c = math.cos(rotation)
     s = math.sin(rotation)
-    return (dx * c + dy * s, -dx * s + dy * c)
+    return dx * c + dy * s, -dx * s + dy * c
 
 
 def is_busy(exc):
@@ -327,9 +326,6 @@ class Detector:
                 handle = str(obj.Handle)
 
                 if name == DRAINAGE_BLOCK:
-                    # Never re-analyze copies produced by this tool.
-                    if layer == MOVED_LAYER:
-                        continue
                     drainages.append({
                         "handle": handle,
                         "obj": obj,
@@ -338,7 +334,6 @@ class Detector:
                         "sx": sx,
                         "sy": sy,
                     })
-
                 elif layer == SLEEPER_LAYER and name in SLEEPER_BLOCKS:
                     profile = self.sleeper_profiles[name]
                     center_local = profile["center_local"]
@@ -375,7 +370,7 @@ class Detector:
 
     @staticmethod
     def _grid_key(p, size):
-        return (math.floor(p[0] / size), math.floor(p[1] / size))
+        return math.floor(p[0] / size), math.floor(p[1] / size)
 
     def _build_grid(self, sleepers):
         grid = {}
@@ -384,7 +379,7 @@ class Detector:
             grid.setdefault(key, []).append(sleeper)
         return grid
 
-    def extract_pipe(self, raw, scale_radius=True):
+    def extract_pipe(self, raw):
         ins = raw["insertion"]
         rot = raw["rotation"]
         sx = float(raw["sx"])
@@ -398,7 +393,7 @@ class Detector:
             (p1[1] + p2[1]) / 2.0,
         )
         ux, uy = normalize(p2[0] - p1[0], p2[1] - p1[1])
-        scale = (abs(sx) + abs(sy)) / 2.0 if scale_radius else 1.0
+        scale = (abs(sx) + abs(sy)) / 2.0
 
         return Pipe(
             raw["handle"],
@@ -413,7 +408,7 @@ class Detector:
             (uy, -ux),
         )
 
-    def match_sleeper(self, pipe, grid, sleepers):
+    def match_sleeper(self, pipe, grid):
         key = self._grid_key(pipe.center, GRID_SIZE_M)
         candidates = []
 
@@ -462,11 +457,7 @@ class Detector:
         for raw in raw_drainages:
             try:
                 pipe = self.extract_pipe(raw)
-                match, confidence, alternatives = self.match_sleeper(
-                    pipe,
-                    grid,
-                    sleepers,
-                )
+                match, confidence, alternatives = self.match_sleeper(pipe, grid)
 
                 result = Result(
                     drainage=pipe.handle,
@@ -540,7 +531,7 @@ class Detector:
                 result.new_y = pipe.center[1] + move_dir[1] * move
 
                 if result.status == "BLOCKED" and move > 0:
-                    result.note = "Move required; original will be preserved"
+                    result.note = "Move required"
                 else:
                     result.note = "No movement required"
 
@@ -557,27 +548,25 @@ class Detector:
 
         return results
 
-    def _ensure_moved_layer(self):
+    def _ensure_marker_layer(self):
         try:
-            layer = retry(lambda: self.doc.Layers.Item(MOVED_LAYER))
+            return retry(lambda: self.doc.Layers.Item(MARKER_LAYER))
         except Exception:
-            layer = retry(lambda: self.doc.Layers.Add(MOVED_LAYER))
-
-        try:
-            layer.Color = MOVED_COLOR_INDEX
-        except Exception:
-            pass
-        return layer
+            return retry(lambda: self.doc.Layers.Add(MARKER_LAYER))
 
     def apply_moves(self, results, save=False):
-        moved = 0
-        moved_layer = self._ensure_moved_layer()
+        marker_layer = self._ensure_marker_layer()
+        try:
+            marker_layer.Color = 1
+        except Exception:
+            pass
 
         try:
             self.doc.StartUndoMark()
         except Exception:
             pass
 
+        moved = 0
         for result in results:
             if (
                 result.status != "BLOCKED"
@@ -587,16 +576,14 @@ class Detector:
                 continue
 
             try:
-                original = retry(
+                obj = retry(
                     lambda handle=result.drainage: self.doc.HandleToObject(handle)
                 )
                 dx = result.new_x - result.old_x
                 dy = result.new_y - result.old_y
 
-                # Preserve the original object. Move only its copied reference.
-                copied = retry(lambda original=original: original.Copy())
                 retry(
-                    lambda copied=copied, dx=dx, dy=dy: copied.Move(
+                    lambda obj=obj, dx=dx, dy=dy: obj.Move(
                         VARIANT(
                             pythoncom.VT_ARRAY | pythoncom.VT_R8,
                             (0.0, 0.0, 0.0),
@@ -608,33 +595,32 @@ class Detector:
                     )
                 )
 
-                try:
-                    copied.Layer = MOVED_LAYER
-                except Exception:
-                    pass
-                try:
-                    copied.Color = MOVED_COLOR_INDEX
-                except Exception:
-                    pass
-
-                result.note = (
-                    f"Moved copy created; original preserved; "
-                    f"move={result.required_move_mm:.1f} mm; "
-                    f"direction=({result.move_dir_x:.4f}, {result.move_dir_y:.4f})"
+                line = retry(
+                    lambda result=result: self.doc.ModelSpace.AddLine(
+                        VARIANT(
+                            pythoncom.VT_ARRAY | pythoncom.VT_R8,
+                            (result.old_x, result.old_y, 0.0),
+                        ),
+                        VARIANT(
+                            pythoncom.VT_ARRAY | pythoncom.VT_R8,
+                            (result.new_x, result.new_y, 0.0),
+                        ),
+                    )
                 )
+                line.Layer = marker_layer.Name
+                line.Color = 1
+
+                result.note = "Moved"
                 moved += 1
 
             except Exception as exc:
                 result.status = "ERROR"
-                result.note = (
-                    f"Move copy failed: {type(exc).__name__}: {exc}"
-                )
+                result.note = f"Move failed: {type(exc).__name__}: {exc}"
 
         try:
             self.doc.Regen(1)
         except Exception:
             pass
-
         try:
             self.doc.EndUndoMark()
         except Exception:
