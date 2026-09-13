@@ -10,12 +10,30 @@ from report_excel import write_xlsx
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Analyze Drainage Pipe E against AG sleepers")
-    parser.add_argument("--apply", action="store_true", help="Apply approved moves to AutoCAD")
-    parser.add_argument("--save", action="store_true", help="Save the DWG after --apply")
-    parser.add_argument("--clearance-mm", type=float, default=DEFAULT_CLEARANCE_M * 1000.0)
-    parser.add_argument("--report", default=None, help="Output XLSX path")
-    parser.add_argument("--limit", type=int, default=0, help="Analyze only first N drainages")
+    parser = argparse.ArgumentParser(
+        description="Analyze Drainage Pipe E against AG sleepers"
+    )
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Create colored moved copies in AutoCAD; originals are preserved",
+    )
+    parser.add_argument(
+        "--save",
+        action="store_true",
+        help="Save the DWG after --apply",
+    )
+    parser.add_argument(
+        "--clearance-mm",
+        type=float,
+        default=DEFAULT_CLEARANCE_M * 1000.0,
+        help="Required final clearance in millimeters",
+    )
+    parser.add_argument(
+        "--report",
+        default=None,
+        help="Output XLSX path",
+    )
     return parser.parse_args()
 
 
@@ -34,33 +52,45 @@ def main():
         print(f"Drawing : {doc.Name}")
         print(f"Mode    : {'APPLY' if args.apply else 'ANALYZE ONLY'}")
         print(f"Clearance: {args.clearance_mm:.1f} mm")
+        print("Scope   : FULL DRAWING")
         print()
 
         results = detector.analyze_all()
-        if args.limit > 0:
-            results = results[:args.limit]
 
         print(f"Drainages analyzed: {len(results)}")
-        for r in results:
-            print(f"{r.drainage:>6}  {r.status:<10}  {r.confidence:<6}  sleeper={r.sleeper or '-':>6}  move={r.required_move_mm:8.1f} mm")
+        for result in results:
+            print(
+                f"{result.drainage:>6}  "
+                f"{result.status:<10}  "
+                f"{result.confidence:<6}  "
+                f"sleeper={result.sleeper or '-':>6}  "
+                f"move={result.required_move_mm:8.1f} mm  "
+                f"dir=({result.move_dir_x:+.4f},{result.move_dir_y:+.4f})"
+            )
 
         moved = 0
         if args.apply:
             print()
-            print("Applying moves...")
+            print("Creating moved copies; original drainage objects will be preserved...")
             moved = detector.apply_moves(results, save=args.save)
-            print(f"Moved: {moved}")
+            print(f"Moved copies created: {moved}")
 
         report_path = args.report
         if not report_path:
             stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            report_path = os.path.join(os.getcwd(), f"drainage_analysis_{stamp}.xlsx")
+            report_path = os.path.join(
+                os.getcwd(),
+                f"drainage_analysis_{stamp}.xlsx",
+            )
 
         write_xlsx(report_path, results, args.clearance_mm)
 
         print()
         print(f"Excel report: {report_path}")
-        print("DWG saved:" if args.save and args.apply else "DWG not saved automatically.")
+        if args.save and args.apply:
+            print("DWG saved.")
+        else:
+            print("DWG not saved automatically.")
         print("=" * 100)
 
     finally:
